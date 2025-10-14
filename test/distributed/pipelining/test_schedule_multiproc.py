@@ -45,7 +45,8 @@ from torch.testing._internal.common_utils import (
 logger = logging.getLogger(__name__)
 
 d_hid = 512
-batch_size = 64
+batch_size = 128
+# batch_size = 16
 torch.manual_seed(0)
 device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
 backend = dist.get_default_backend_for_device(device_type)
@@ -68,15 +69,17 @@ def setup_models_and_data(
 
     full_mod = model_class(d_hid, n_layers=n_layers)
     full_mod.to(config.device)
-    ref_mod = copy.deepcopy(full_mod)
+    # ref_mod = copy.deepcopy(full_mod)
 
     x = torch.randn(batch_size, d_hid, device=config.device)
     with torch.no_grad():
-        y = ref_mod(x)
+        # y = ref_mod(x)
+        y = full_mod(x)
         target = y + torch.randn(batch_size, d_hid, device=config.device)
 
     loss_fn = torch.nn.MSELoss(reduction="sum")
-    return full_mod, ref_mod, x, target, loss_fn
+    # return full_mod, ref_mod, x, target, loss_fn
+    return full_mod, None, x, target, loss_fn
 
 
 def create_single_stage_pipeline(
@@ -94,10 +97,14 @@ def create_single_stage_pipeline(
         # Manual stage creation
         submod_name = f"layers.{config.rank}"
         stage_module = mod.get_submodule(submod_name)
+        import copy
+        stage_module_new = copy.deepcopy(stage_module)
         stage = PipelineStage(
-            stage_module, config.rank, config.world_size, config.device
+            # stage_module, config.rank, config.world_size, config.device
+            stage_module_new, config.rank, config.world_size, config.device
         )
-        return stage, stage_module, [stage_module]
+        # return stage, stage_module, [stage_module]
+        return stage, stage_module_new, [stage_module_new]
 
 
 def create_multi_stage_pipeline(
@@ -819,6 +826,156 @@ class ScheduleTest(MultiProcContinuousTest):
             self.config, stage_modules, ref_mod, submod_names, rtol=3e-5, atol=5e-3
         )
 
+    # @requires_accelerator_dist_backend(["nccl", "xccl"])
+    @requires_accelerator_dist_backend(["nccl"])
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
+    )
+    @parametrize(
+        "ScheduleClass",
+        # [Schedule1F1B, ScheduleInterleaved1F1B],
+        [Schedule1F1B,],
+    )
+    def test_stage_inputs_grads_memory_usage(self, ScheduleClass):
+        # global d_hid
+        # d_hid = 4096
+        mempool = torch.cuda.MemPool()
+        torch.cuda.empty_cache()
+        stream = torch.cuda.Stream()
+        class CustomLinearFunction(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, input, weight, bias=None, grad_input_data_ptrs=set()):
+                ctx.save_for_backward(input, weight, bias)
+                output = torch.matmul(input, weight.t())
+                if bias is not None:
+                    output += bias.unsqueeze(0).expand_as(output)
+                ctx.grad_input_data_ptrs = grad_input_data_ptrs
+                return output
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                input, weight, bias = ctx.saved_tensors
+
+                # input @ weight.T = output
+                # dinput = grad_output @ (weight.T).T
+                # d(weight.T) = input.T @ grad_output
+                # torch.cuda.synchronize()
+                with torch.cuda.stream(stream):
+                    grad_input = grad_output * 0.5
+                    # grad_input = torch.matmul(grad_output, weight)
+                # torch.cuda.synchronize()
+                # torch.cuda.current_stream().wait_stream(stream)
+                ctx.grad_input_data_ptrs.add(grad_input.data_ptr())
+                grad_weight = torch.matmul(grad_output.t(), input)
+                if bias is not None:
+                    grad_bias = grad_output.sum(0)
+                else:
+                    grad_bias = None
+
+                return grad_input, grad_weight, grad_bias, None
+            
+        class CustomLinear(torch.nn.Linear):
+            def forward(self, input):
+                if not hasattr(self, "grad_input_data_ptrs"):
+                    self.grad_input_data_ptrs = set()
+                return CustomLinearFunction.apply(input, self.weight, self.bias, self.grad_input_data_ptrs)
+            
+            def get_grad_input_data_ptrs(self):
+                return self.grad_input_data_ptrs
+
+            @classmethod
+            def from_linear(cls, mod: torch.nn.Linear):
+                """Generate CustomLinear from a naive nn.Linear layer"""
+                with torch.device(mod.weight.device):
+                    new_mod = cls(
+                        mod.in_features,
+                        mod.out_features,
+                        bias=False
+                    )
+                new_mod.weight = mod.weight
+                new_mod.bias = mod.bias
+
+                return new_mod
+
+        def swap_headmost_linear_layers(module: torch.nn.Module, linear_func: torch.nn.Linear):
+            if isinstance(module, torch.nn.Linear):
+                return linear_func(module)
+            
+            root_module = module
+            swapped = False
+
+            def post_order_traversal(module, cur_fqn=None, parent_module=None):
+                nonlocal swapped
+                if swapped:
+                    return
+                if cur_fqn is None:
+                    cur_fqn = ""
+
+                for child_module_name, child_module in module.named_children():
+                    if cur_fqn == "":
+                        new_fqn = child_module_name
+                    else:
+                        new_fqn = f"{cur_fqn}.{child_module_name}"
+
+                    post_order_traversal(child_module, new_fqn, module)
+                
+                if isinstance(module, torch.nn.Linear):
+                    new_linear_module = linear_func(module)
+                    cur_module_name = cur_fqn.split(".")[-1]
+                    setattr(parent_module, cur_module_name, new_linear_module)
+                    swapped = True
+            
+            post_order_traversal(root_module)
+
+            return root_module
+
+        multi_stage_pipeline = False
+        # multi_stage_pipeline = True if ScheduleClass in [ScheduleInterleaved1F1B, ] else False
+        stages_per_rank = 2 if multi_stage_pipeline else 1
+        n_stages = stages_per_rank * self.world_size
+        mod, _, x, target, loss_fn = setup_models_and_data(
+            self.config, n_layers=n_stages, model_class=MultiMLP
+        )
+
+        if multi_stage_pipeline:
+            stages, stage_modules, submod_names = create_multi_stage_pipeline(
+                self.config, mod, stages_per_rank, n_stages
+            )
+        else:
+            # of self.world_size layers
+            chunks = x.shape[0]
+            stage, stage_module, _ = create_single_stage_pipeline(
+                self.config, mod, x, chunks, use_tracer=False
+            )
+            del mod
+            torch.cuda.empty_cache()
+            swap_headmost_linear_layers(stage_module, lambda m : CustomLinear.from_linear(m))
+
+            print(f"rank: {self.rank}, {stage.submod}")
+
+            schedule = ScheduleClass(stage, chunks, loss_fn=loss_fn, scale_grads=False)
+
+            # # Run
+            for _ in range(2):
+                torch.cuda.reset_peak_memory_stats(self.device)
+                pre = torch.cuda.memory_stats(self.device)['active_bytes.all.peak']
+                # print(f"rank: {self.rank}, {pre}")
+                if self.rank == 0:
+                    schedule.step(x)
+                elif self.rank == self.world_size - 1:
+                    losses = []
+                    schedule.step(target=target, losses=losses)
+                else:
+                    schedule.step()
+                post = torch.cuda.memory_stats(self.device)['active_bytes.all.peak']
+                # print(f"rank: {self.rank}, {post}")
+                
+                # print(f"rank: {self.rank}, {post - pre}")
+                # print(f"rank: {self.rank}, {torch.cuda.max_memory_reserved(self.device)}")
+                
+                for _, module in stage.submod.named_modules():
+                    if isinstance(module, CustomLinear):
+                        print(f"rank: {self.rank}, {len(module.get_grad_input_data_ptrs())}")
 
 instantiate_parametrized_tests(ScheduleTest)
 
